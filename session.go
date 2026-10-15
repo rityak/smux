@@ -77,7 +77,20 @@ type writeRequest struct {
 	frame  Frame
 	seq    uint32
 	result chan writeResult
+	// state is shared by the copies of a request: the send loop claims it
+	// before reading frame.data and a writer that gives up cancels it, so the
+	// caller's buffer is never read after writeFrameInternal returns.
+	state *atomic.Int32
+	// released is closed by the send loop once it no longer reads frame.data:
+	// after copying it, or after a scatter-gather write.
+	released chan struct{}
 }
+
+const (
+	requestQueued int32 = iota
+	requestSending
+	requestCanceled
+)
 
 // writeResult represents the result of a write request
 type writeResult struct {
@@ -619,6 +632,9 @@ EVENT_LOOP:
 					s.notifyShaperConsumed()
 					goto EVENT_LOOP
 				}
+				if !request.state.CompareAndSwap(requestQueued, requestSending) {
+					continue // the writer gave up and may already reuse frame.data
+				}
 
 				buf[0] = request.frame.ver
 				buf[1] = request.frame.cmd
@@ -630,8 +646,11 @@ EVENT_LOOP:
 					vec[0] = buf[:headerSize]
 					vec[1] = request.frame.data
 					n, err = bw.WriteBuffers(vec)
+					vec[1] = nil
+					close(request.released)
 				} else {
 					copy(buf[headerSize:], request.frame.data)
+					close(request.released)
 					n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
 				}
 
@@ -670,10 +689,12 @@ func (s *Session) writeControlFrame(f Frame) (n int, err error) {
 // internal writeFrame version to support deadline used in keepalive
 func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class CLASSID) (int, error) {
 	req := writeRequest{
-		class:  class,
-		frame:  f,
-		seq:    atomic.AddUint32(&s.requestID, 1),
-		result: make(chan writeResult, 1),
+		class:    class,
+		frame:    f,
+		seq:      atomic.AddUint32(&s.requestID, 1),
+		result:   make(chan writeResult, 1),
+		state:    new(atomic.Int32),
+		released: make(chan struct{}),
 	}
 	select {
 	case s.shaper <- req:
@@ -689,10 +710,21 @@ func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class C
 	case result := <-req.result:
 		return result.n, result.err
 	case <-s.die:
-		return 0, io.ErrClosedPipe
+		return abandonRequest(req, io.ErrClosedPipe)
 	case <-s.chSocketWriteError:
-		return 0, s.socketWriteError.Load().(error)
+		return abandonRequest(req, s.socketWriteError.Load().(error))
 	case <-deadline:
-		return 0, ErrTimeout
+		return abandonRequest(req, ErrTimeout)
 	}
+}
+
+// abandonRequest gives up on a queued request. If the send loop has already
+// claimed it, it waits until the loop no longer reads frame.data, which the
+// caller reuses once this returns. That is a copy, except for a scatter-gather
+// write, which is waited for.
+func abandonRequest(req writeRequest, err error) (int, error) {
+	if !req.state.CompareAndSwap(requestQueued, requestCanceled) {
+		<-req.released
+	}
+	return 0, err
 }
